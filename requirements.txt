@@ -1,0 +1,13 @@
+h5py
+python-multipart
+reportlab
+fastapi
+uvicorn
+torch
+torchvision
+pillow
+scikit-learn
+pandas
+numpy
+
+

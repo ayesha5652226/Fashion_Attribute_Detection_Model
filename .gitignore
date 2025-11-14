@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.Python
+*.sqlite3
+
+# Virtualenv
+venv/
+ENV/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Python packages
+*.egg-info/
+dist/
+build/
+
+# macOS
+*.DS_Store
+
+# Logs
+*.log
+
+# Optional: if you prefer not to commit the HDF5 or unzipped large model, ignore them:
+# model/finetuned_resnet50_multilabel.h5
+# model/model_quantized_scripted.pt
