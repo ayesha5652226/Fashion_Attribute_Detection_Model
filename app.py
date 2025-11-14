@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Dict
 
 from fastapi import FastAPI, File, UploadFile, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -168,131 +168,132 @@ def image_bytes_to_data_url(img_bytes: bytes, img_format="jpeg") -> str:
 def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request, "result": None, "image_data": None})
 
+# --- Predict route with robust exception logging (does not change structure) ---
 @app.post("/predict", response_class=HTMLResponse)
 async def predict(request: Request, file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        image_bytes = await file.read()
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    x = transform(img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        outs = model(x)
-    # If model is scripted it might return list of tensors, or a tuple — normalize
-    if isinstance(outs, torch.Tensor):
-        # if model returns a single tensor (unlikely for multi-head), handle it
-        outs = [outs]
-    preds_idx = [int(o.argmax(dim=1).cpu().item()) for o in outs]
+        x = transform(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            outs = model(x)
 
-    result_map: Dict[str, str] = {}
-    for raw_name, idx in zip(target_cols, preds_idx):
-        label = mlb_dict[raw_name].classes_[idx]
-        nice = pretty_attr_name(raw_name)
-        result_map[nice] = str(label)
+        # Normalize outputs in case scripted model returns a different type
+        if isinstance(outs, torch.Tensor):
+            outs = [outs]
+        preds_idx = [int(o.argmax(dim=1).cpu().item()) for o in outs]
 
-    fmt = (file.filename.split(".")[-1].lower() if "." in file.filename else "jpeg")
-    if fmt not in ("jpg", "jpeg", "png", "gif", "webp"):
-        fmt = "jpeg"
-    data_url = image_bytes_to_data_url(image_bytes, img_format=fmt if fmt!="jpg" else "jpeg")
+        result_map: Dict[str, str] = {}
+        for raw_name, idx in zip(target_cols, preds_idx):
+            label = mlb_dict[raw_name].classes_[idx]
+            nice = pretty_attr_name(raw_name)
+            result_map[nice] = str(label)
 
-    desired_order = ["Pattern", "Color", "Sleeve Length", "Sleeve Type", "Dress Length",
-                     "Size", "Neckline", "Fabric", "Occasion"]
-    table_rows = []
-    for k in desired_order:
-        if k in result_map:
-            table_rows.append((k, result_map[k]))
-    for k, v in result_map.items():
-        if k not in set(desired_order):
-            table_rows.append((k, v))
+        fmt = (file.filename.split(".")[-1].lower() if "." in file.filename else "jpeg")
+        if fmt not in ("jpg", "jpeg", "png", "gif", "webp"):
+            fmt = "jpeg"
+        data_url = image_bytes_to_data_url(image_bytes, img_format=fmt if fmt!="jpg" else "jpeg")
 
-    return templates.TemplateResponse("index.html", {"request": request, "result": table_rows, "image_data": data_url})
+        desired_order = ["Pattern", "Color", "Sleeve Length", "Sleeve Type", "Dress Length",
+                         "Size", "Neckline", "Fabric", "Occasion"]
+        table_rows = []
+        for k in desired_order:
+            if k in result_map:
+                table_rows.append((k, result_map[k]))
+        for k, v in result_map.items():
+            if k not in set(desired_order):
+                table_rows.append((k, v))
 
-# --- Corrected download_pdf route (reads multiple 'row' fields) ---
+        return templates.TemplateResponse("index.html", {"request": request, "result": table_rows, "image_data": data_url})
+
+    except Exception as e:
+        log.exception("Unhandled exception in /predict: %s", e)
+        return PlainTextResponse("Internal server error during prediction. Check logs.", status_code=500)
+
+# --- PDF download route with robust exception logging (does not change structure) ---
 @app.post("/download_pdf")
 async def download_pdf(request: Request):
-    """
-    Expects form fields:
-      - image_data: data URL (base64) of the image
-      - row: repeated form field "Feature::Value" for each row
-    Returns a PDF file as a streaming response.
-    """
-    form = await request.form()
-    image_data = form.get("image_data")
-    # Starlette's FormData supports getlist
-    rows_list = form.getlist("row") if hasattr(form, "getlist") else []
+    try:
+        form = await request.form()
+        image_data = form.get("image_data")
+        rows_list = form.getlist("row") if hasattr(form, "getlist") else []
 
-    # parse rows_list into (feature, value)
-    rows = []
-    for line in rows_list:
-        if not line:
-            continue
-        if "::" in line:
-            k, v = line.split("::", 1)
-            rows.append((k.strip(), v.strip()))
-        else:
-            rows.append((line.strip(), ""))
+        rows = []
+        for line in rows_list:
+            if not line:
+                continue
+            if "::" in line:
+                k, v = line.split("::", 1)
+                rows.append((k.strip(), v.strip()))
+            else:
+                rows.append((line.strip(), ""))
 
-    # Create PDF in memory
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
 
-    # Title
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(40, height - 60, "Fashion Attribute Prediction Report")
+        # Title
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(40, height - 60, "Fashion Attribute Prediction Report")
 
-    # Draw uploaded image if present
-    if image_data and image_data.startswith("data:image/"):
-        try:
-            header, b64 = image_data.split(",", 1)
-            img_bytes = base64.b64decode(b64)
-            img = ImageReader(io.BytesIO(img_bytes))
-            img_w, img_h = img.getSize()
-            max_w, max_h = 220, 220
-            scale = min(max_w / img_w, max_h / img_h, 1.0)
-            draw_w, draw_h = img_w * scale, img_h * scale
-            c.drawImage(img, 40, height - 60 - draw_h - 10, width=draw_w, height=draw_h)
-        except Exception:
-            pass
+        # Draw uploaded image if present
+        if image_data and image_data.startswith("data:image/"):
+            try:
+                header, b64 = image_data.split(",", 1)
+                img_bytes = base64.b64decode(b64)
+                img = ImageReader(io.BytesIO(img_bytes))
+                img_w, img_h = img.getSize()
+                max_w, max_h = 220, 220
+                scale = min(max_w / img_w, max_h / img_h, 1.0)
+                draw_w, draw_h = img_w * scale, img_h * scale
+                c.drawImage(img, 40, height - 60 - draw_h - 10, width=draw_w, height=draw_h)
+            except Exception:
+                log.exception("Failed to draw image into PDF; continuing without image.")
 
-    # Timestamp
-    import datetime
-    c.setFont("Helvetica", 9)
-    c.drawString(40, height - 60 - 240, f"Generated: {datetime.datetime.now().isoformat(sep=' ', timespec='seconds')}")
+        import datetime
+        c.setFont("Helvetica", 9)
+        c.drawString(40, height - 60 - 240, f"Generated: {datetime.datetime.now().isoformat(sep=' ', timespec='seconds')}")
 
-    # Draw table header and rows to the right of image
-    table_x = 300
-    table_y_start = height - 100
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(table_x, table_y_start, "Feature")
-    c.drawString(table_x + 200, table_y_start, "Prediction")
-    c.line(table_x, table_y_start - 4, table_x + 380, table_y_start - 4)
+        # Draw table header and rows to the right of image
+        table_x = 300
+        table_y_start = height - 100
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(table_x, table_y_start, "Feature")
+        c.drawString(table_x + 200, table_y_start, "Prediction")
+        c.line(table_x, table_y_start - 4, table_x + 380, table_y_start - 4)
 
-    c.setFont("Helvetica", 10)
-    y = table_y_start - 20
-    row_h = 18
-    for (feature, value) in rows:
-        if y < 60:
-            c.showPage()
-            y = height - 80
-            c.setFont("Helvetica-Bold", 11)
-            c.drawString(table_x, y, "Feature")
-            c.drawString(table_x + 200, y, "Prediction")
-            y -= 20
-            c.setFont("Helvetica", 10)
-        c.drawString(table_x, y, feature)
-        c.drawString(table_x + 200, y, str(value))
-        y -= row_h
+        c.setFont("Helvetica", 10)
+        y = table_y_start - 20
+        row_h = 18
+        for (feature, value) in rows:
+            if y < 60:
+                c.showPage()
+                y = height - 80
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(table_x, y, "Feature")
+                c.drawString(table_x + 200, y, "Prediction")
+                y -= 20
+                c.setFont("Helvetica", 10)
+            c.drawString(table_x, y, feature)
+            c.drawString(table_x + 200, y, str(value))
+            y -= row_h
 
-    # Disclaimer bottom
-    disclaimer = "Disclaimer: This model is a prototype for demo/educational use. Predictions may be inaccurate."
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawString(40, 40, disclaimer)
+        # Disclaimer bottom
+        disclaimer = "Disclaimer: This model is a prototype for demo/educational use. Predictions may be inaccurate."
+        c.setFont("Helvetica-Oblique", 8)
+        c.drawString(40, 40, disclaimer)
 
-    c.showPage()
-    c.save()
-    buffer.seek(0)
+        c.showPage()
+        c.save()
+        buffer.seek(0)
 
-    return StreamingResponse(buffer, media_type="application/pdf",
-                             headers={"Content-Disposition": "attachment; filename=prediction_report.pdf"})
+        return StreamingResponse(buffer, media_type="application/pdf",
+                                 headers={"Content-Disposition": "attachment; filename=prediction_report.pdf"})
+
+    except Exception as e:
+        log.exception("Unhandled exception in /download_pdf: %s", e)
+        return PlainTextResponse("Internal server error during PDF generation. Check logs.", status_code=500)
 
 @app.get("/health")
 def health():
